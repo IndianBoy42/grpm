@@ -18,21 +18,25 @@ pub enum ReleaseFinder {
 }
 
 impl ReleaseFinder {
-    async fn find(&self, rels: ReleasesHandler<'_, '_>) -> Result<Release, Error> {
+    async fn find(&self, rels: ReleasesHandler<'_, '_>) -> Result<Option<Release>, Error> {
         match self {
-            ReleaseFinder::Latest => rels.get_latest().await,
-            ReleaseFinder::ByTag(tag) => rels.get_by_tag(&tag).await,
+            ReleaseFinder::Latest => rels.get_latest().await.map(Some),
+            // TODO: handle missing release in the by tag
+            ReleaseFinder::ByTag(tag) => rels.get_by_tag(&tag).await.map(Some),
             ReleaseFinder::ByRegex(re) => {
                 let mut current_page = rels.list().per_page(100).page(0u32).send().await?;
-                let mut prs = current_page.take_items();
+                let prs = {
+                    let mut prs = current_page.take_items();
 
-                let inst = octocrab::instance();
+                    let inst = octocrab::instance();
+                    while let Ok(Some(mut new_page)) = inst.get_page(&current_page.next).await {
+                        prs.extend(new_page.take_items());
+                    }
 
-                while let Ok(Some(mut new_page)) = inst.get_page(&current_page.next).await {
-                    prs.extend(new_page.take_items());
-                }
+                    prs
+                };
 
-                todo!("Complete regex search")
+                Ok(prs.into_iter().filter(|x| re.is_match(&x.tag_name)).next())
             }
         }
     }
@@ -50,18 +54,29 @@ pub enum AssetFinder {
 }
 
 impl AssetFinder {
-    async fn find(&self, rels: ReleasesHandler<'_, '_>) -> Result<Asset, Error> {
+    async fn find(&self, rels: ReleasesHandler<'_, '_>) -> Result<Option<Asset>, Error> {
         Ok(match self {
-            AssetFinder::ByRegex(relfin, _) => {
+            AssetFinder::ByRegex(relfin, re) => {
                 let rel = relfin.find(rels).await?;
-                todo!("search through {:?}", rel.assets)
+                eprintln!("search through {:#?}", rel);
+                rel.and_then(|rel| {
+                    rel.assets
+                        .into_iter()
+                        .filter(|x| re.is_match(&x.name))
+                        .next()
+                })
             }
-            &AssetFinder::ById(id) => rels.get_asset(id).await?,
+            // TODO: handle missing asset in the by id (convert to option)
+            &AssetFinder::ById(id) => Some(rels.get_asset(id).await?),
         })
     }
 }
 
-pub async fn find_release(user: &str, repo: &str, find: ReleaseFinder) -> Result<Release, Error> {
+pub async fn find_release(
+    user: &str,
+    repo: &str,
+    find: ReleaseFinder,
+) -> Result<Option<Release>, Error> {
     let inst = octocrab::instance();
     let repos = inst.repos(user, repo);
     let rels = repos.releases();
@@ -69,7 +84,7 @@ pub async fn find_release(user: &str, repo: &str, find: ReleaseFinder) -> Result
     find.find(rels).await
 }
 
-pub async fn find_asset(user: &str, repo: &str, find: AssetFinder) -> Result<Asset, Error> {
+pub async fn find_asset(user: &str, repo: &str, find: AssetFinder) -> Result<Option<Asset>, Error> {
     let inst = octocrab::instance();
     let repos = inst.repos(user, repo);
     let rels = repos.releases();
@@ -77,6 +92,6 @@ pub async fn find_asset(user: &str, repo: &str, find: AssetFinder) -> Result<Ass
     find.find(rels).await
 }
 
-pub async fn download_asset(asset: Asset) -> Result<Vec<u8>, Error>{
+pub async fn download_asset(asset: Asset) -> Result<Vec<u8>, Error> {
     todo!("Choose how to downlod")
 }
