@@ -61,18 +61,22 @@ impl AssetFinder {
     }
 }
 
-pub fn find_release(user: &str, repo: &str, find: ReleaseFinder) -> Result<Release, Error> {
+pub async fn find_release(user: &str, repo: &str, find: ReleaseFinder) -> Result<Release, Error> {
     let inst = octocrab::instance();
     let repos = inst.repos(user, repo);
     let rels = repos.releases();
 
-    block_on(find.find(rels))
+    find.find(rels).await
 }
 
-fn find_asset(user: &str, repo: &str, find: AssetFinder) -> Result<Asset, Error> {
+pub async fn find_asset(user: &str, repo: &str, find: AssetFinder) -> Result<Asset, Error> {
     let inst = octocrab::instance();
     let repos = inst.repos(user, repo);
     let rels = repos.releases();
 
-    block_on(find.find(rels))
+    find.find(rels).await
+}
+
+pub async fn download_asset(asset: Asset) -> Result<Vec<u8>, Error>{
+    todo!("Choose how to downlod")
 }
