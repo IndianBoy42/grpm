@@ -25,22 +25,26 @@ impl ReleaseFinder {
             ReleaseFinder::ByTag(tag) => rels.get_by_tag(&tag).await.map(Some),
             ReleaseFinder::ByRegex(re) => {
                 let mut current_page = rels.list().per_page(100).page(0u32).send().await?;
-                let prs = {
-                    let mut prs = current_page.take_items();
+                let mut prs = current_page.take_items();
 
-                    let inst = octocrab::instance();
-                    while let Ok(Some(mut new_page)) = inst.get_page(&current_page.next).await {
-                        prs.extend(new_page.take_items());
+                let inst = octocrab::instance();
+                while let Ok(Some(mut new_page)) = inst.get_page(&current_page.next).await {
+                    prs.extend(new_page.take_items());
+
+                    for page in prs.drain(..) {
+                        if re.is_match(&page.tag_name) {
+                            return Ok(Some(page));
+                        }
                     }
+                }
 
-                    prs
-                };
-
-                Ok(prs.into_iter().filter(|x| re.is_match(&x.tag_name)).next())
+                Ok(None)
+                // Ok(prs.into_iter().findl(|x| re.is_match(&x.tag_name)))
             }
         }
     }
 }
+
 impl Default for ReleaseFinder {
     fn default() -> Self {
         Self::Latest
@@ -59,12 +63,7 @@ impl AssetFinder {
             AssetFinder::ByRegex(relfin, re) => {
                 let rel = relfin.find(rels).await?;
                 eprintln!("search through {:#?}", rel);
-                rel.and_then(|rel| {
-                    rel.assets
-                        .into_iter()
-                        .filter(|x| re.is_match(&x.name))
-                        .next()
-                })
+                rel.and_then(|rel| rel.assets.into_iter().find(|x| re.is_match(&x.name)))
             }
             // TODO: handle missing asset in the by id (convert to option)
             &AssetFinder::ById(id) => Some(rels.get_asset(id).await?),

@@ -1,5 +1,5 @@
-mod tuiapp;
 mod common;
+mod tuiapp;
 
 const HELP: &str = "\
 Github Releases Package Manager
@@ -12,18 +12,26 @@ OPTIONS:
 COMMAND:
     tui               Open the TUI for interactively finding and installing
 cli -- If any arguments are not provided then the TUI opens
-    install [URL] [VERSION] [FILE] Install from URL with 
-    search  [URL] [VERSION] [FILE] Search releases from URL
-    VERSION and FILE are regexes
-    `[VERSION] [FILE]` may be replaced by `[ASSETID]` for directly finding a certain asset
+    install [OWNER] [REPO] [VERSION] [FILE] Install from URL with 
+    search  [OWNER] [REPO] [VERSION] [FILE] Search releases from URL
+
+    VERSION and FILE can be one of the following:
+    `[VERSION] [FILE]`     may be replaced by `[ASSETID]` for directly finding a certain asset
+    [VERSION] = latest,    get the latest download
+    [VERSION] = -t {TAG},  get a certain tag
+    [VERSION] = -r {TAG},  get first matching a certain regex
     URL is a string like 'user/repo'
 ";
 
 #[derive(Debug)]
-pub struct Args {}
+pub struct Args {
+    command: String,
+}
 impl Default for Args {
     fn default() -> Self {
-        Args {}
+        Args {
+            command: "tui".to_string(),
+        }
     }
 }
 impl Args {
@@ -34,9 +42,11 @@ impl Args {
             std::process::exit(0);
         }
 
+        let command: String = pargs.free_from_str().unwrap();
+
         let dargs = Args::default();
 
-        Args {}
+        Args { command }
     }
 }
 
@@ -45,7 +55,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse_env();
 
+    if args.command.eq_ignore_ascii_case("tui") {
+       tuiapp::tui(args); 
+    }
+
     Ok(())
 }
-
-
