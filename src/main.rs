@@ -1,3 +1,5 @@
+use pico_args::Error::MissingArgument;
+
 mod common;
 mod tuiapp;
 
@@ -42,7 +44,16 @@ impl Args {
             std::process::exit(0);
         }
 
-        let command: String = pargs.free_from_str().unwrap();
+        let command: String = match pargs.free_from_str() {
+            Ok(e) => e,
+            Err(MissingArgument) => {
+                eprintln!("No command given");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                std::panic!("{}", e);
+            }
+        };
 
         let dargs = Args::default();
 
@@ -55,9 +66,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse_env();
 
-    if args.command.eq_ignore_ascii_case("tui") {
-       tuiapp::tui(args); 
-    }
 
-    Ok(())
+    match args.command.to_ascii_lowercase().as_str() {
+        "tui" => tuiapp::tui(args),
+        _ => panic!("Invalid Command"),
+    }
 }

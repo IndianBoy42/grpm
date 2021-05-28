@@ -3,18 +3,17 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use itertools::{izip, Itertools};
-use octocrab::models::repos::Release;
-use std::convert::TryInto;
+use futures::executor::block_on;
+use itertools::Itertools;
+use octocrab::models::repos::{Asset, Release};
+use regex::Regex;
 use std::io::stdout;
-use std::ops::{Range, Rem};
+use std::ops::Add;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
-use tui::widgets::{
-    self, Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, LineGauge, Paragraph, Row,
-    Wrap,
-};
+use tui::widgets::Table;
+use tui::widgets::{Block, BorderType, Borders, Paragraph, Row, Wrap};
 use tui::{backend::CrosstermBackend, Terminal};
 use tui::{
     layout::Direction,
@@ -24,13 +23,9 @@ use tui::{
     layout::{Alignment, Constraint, Layout, Rect},
     text::Text,
 };
-use tui::{symbols, Frame};
-use tui::{
-    text::{Span, Spans},
-    widgets::Table,
-};
+use tui::Frame;
 
-use crate::Args;
+use crate::{common, Args};
 
 type Backend = CrosstermBackend<std::io::Stdout>;
 
@@ -49,14 +44,18 @@ struct TuiApp {
     field_selected: usize,
     owner: String,
     repo: String,
-    release: String,
-    asset: String,
+    search_rels: String,
+    search_assets: String,
+
+    release_re: Option<Regex>,
+    asset_re: Option<Regex>,
 
     selected_col: usize,
     selected_asset: usize,
-    selected_rel: usize,
+    selected_release: usize,
+    all_releases: Vec<Release>,
     found_releases: Vec<Release>,
-    found_assets: Vec<Release>,
+    found_assets: Vec<Asset>,
 }
 
 struct Areas {
@@ -139,20 +138,32 @@ impl Areas {
 }
 
 impl TuiApp {
+    fn selected_field_mut(&mut self) -> &mut String {
+        match self.field_selected {
+            0 => &mut self.owner,
+            1 => &mut self.repo,
+            2 => &mut self.search_rels,
+            3 => &mut self.search_assets,
+            _ => panic!("Invalid field"),
+        }
+    }
     fn new(args: Args) -> Self {
         Self {
             args,
             owner: String::from("<search>"),
             repo: String::from("<search>"),
-            release: String::from("<search>"),
-            asset: String::from("<search>"),
+            search_rels: String::from("<search>"),
+            search_assets: String::from("<search>"),
             desc_box_size: 10,
             field_selected: 0,
             found_releases: Vec::new(),
+            all_releases: Vec::new(),
             found_assets: Vec::new(),
             selected_col: 0,
-            selected_rel: 0,
+            selected_release: 0,
             selected_asset: 0,
+            release_re: None,
+            asset_re: None,
         }
     }
 
@@ -176,21 +187,37 @@ impl TuiApp {
         f.render_widget(text("Release", key_style), chunks.release_key);
         f.render_widget(text("Asset", key_style), chunks.asset_key);
 
-        let field_style = Style::default()
-            .fg(Color::White)
-            .bg(Color::Black)
-            .add_modifier(Modifier::UNDERLINED);
-        f.render_widget(text(&self.owner, field_style), chunks.owner_field);
-        f.render_widget(text(&self.repo, field_style), chunks.repo_field);
-        f.render_widget(text(&self.release, field_style), chunks.release_field);
-        f.render_widget(text(&self.asset, field_style), chunks.asset_field);
+        let field_style = |i| {
+            let a = Style::default().fg(Color::White).bg(Color::Black);
+            if self.field_selected == i {
+                a.add_modifier(Modifier::UNDERLINED)
+            } else {
+                a
+            }
+        };
+        f.render_widget(text(&self.owner, field_style(0)), chunks.owner_field);
+        f.render_widget(text(&self.repo, field_style(1)), chunks.repo_field);
+        f.render_widget(
+            text(&self.search_rels, field_style(2)),
+            chunks.release_field,
+        );
+        f.render_widget(
+            text(&self.search_assets, field_style(3)),
+            chunks.asset_field,
+        );
 
         let button_style = Style::default()
             .fg(Color::White)
             .bg(Color::Blue)
             .add_modifier(Modifier::BOLD);
-        f.render_widget(text("Install", button_style), chunks.buttons[0]);
-        f.render_widget(text("Link", button_style), chunks.buttons[1]);
+        f.render_widget(
+            text("Install", button_style).alignment(Alignment::Center),
+            chunks.buttons[0],
+        );
+        f.render_widget(
+            text("Link", button_style).alignment(Alignment::Center),
+            chunks.buttons[1],
+        );
 
         let releases = Table::new(
             self.found_releases
@@ -209,7 +236,7 @@ impl TuiApp {
 
         let assets = Table::new(
             self.found_releases
-                .get(self.selected_rel)
+                .get(self.selected_release)
                 .map(|x| {
                     x.assets
                         .iter()
@@ -233,7 +260,7 @@ impl TuiApp {
                 //Releases
                 let body = self
                     .found_releases
-                    .get(self.selected_rel)
+                    .get(self.selected_release)
                     .and_then(|x| x.body.as_ref())
                     .map(|x| x.as_str())
                     .unwrap_or("");
@@ -241,16 +268,132 @@ impl TuiApp {
             }
             1 => {
                 //Assets
-                let body = self.found_releases[self.selected_rel].assets[self.selected_asset]
+                let body = self.found_releases[self.selected_release].assets[self.selected_asset]
                     .browser_download_url
                     .to_string();
                 Text::raw(body)
             }
             _ => Text::raw(""),
         };
+        let desc = Paragraph::new(desc).wrap(Wrap { trim: false });
+        f.render_widget(desc, chunks.description);
+    }
+
+    fn update_release_re(&mut self, recompile: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if recompile {
+            self.release_re = Some(Regex::new(&self.search_rels)?);
+        }
+        self.found_releases = if let Some(re) = &self.release_re {
+            self.all_releases
+                .iter()
+                .cloned()
+                .filter(|rel| re.is_match(&rel.tag_name))
+                .collect_vec()
+        } else {
+            self.all_releases.clone()
+        };
+        self.selected_release = 0;
+        self.selected_asset = 0;
+        self.update_asset_re(false)?;
+        Ok(())
+    }
+    fn update_asset_re(&mut self, recompile: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if recompile {
+            self.asset_re = Some(Regex::new(&self.search_assets)?);
+        }
+        self.found_assets = if let Some(re) = &self.asset_re {
+            self.found_releases[self.selected_release]
+                .assets
+                .iter()
+                .cloned()
+                .filter(|ass| re.is_match(&ass.name))
+                .collect_vec()
+        } else {
+            self.found_releases[self.selected_release].assets.clone()
+        };
+        Ok(())
     }
 
     fn on_key(&mut self, key: KeyCode) -> Result<(), Box<dyn std::error::Error>> {
+        match key {
+            KeyCode::Char(c) => {
+                let f = self.selected_field_mut();
+                if f == "<search>" {
+                    f.clear();
+                }
+                f.push(c);
+
+                match self.field_selected {
+                    // Only Update the repo on Enter
+                    0 | 1 => {}
+                    // Update the regexes
+                    2 => self.update_release_re(true)?,
+                    3 => self.update_asset_re(true)?,
+                    _ => panic!("Invalid field"),
+                };
+            }
+            KeyCode::Backspace => {
+                let f = self.selected_field_mut();
+                if f == "<search>" {
+                    f.clear();
+                }
+                f.pop();
+
+                match self.field_selected {
+                    // Only Update the repo on Enter
+                    0 | 1 => {}
+                    // Update the regexes
+                    2 => self.update_release_re(true)?,
+                    3 => self.update_asset_re(true)?,
+                    _ => panic!("Invalid field"),
+                };
+            }
+            KeyCode::Enter => {
+                match self.field_selected {
+                    // Update the repo
+                    0 | 1 => {
+                        self.selected_col = 0;
+                        self.selected_asset = 0;
+                        self.selected_release = 0;
+                        self.all_releases =
+                            // TODO: move this to a different thread?
+                            block_on(common::list_releases(&self.owner, &self.repo))?;
+                        self.found_releases = self.all_releases.clone();
+                    }
+                    2 => self.update_release_re(true)?,
+                    3 => self.update_asset_re(true)?,
+                    _ => panic!("Invalid field"),
+                };
+            }
+            KeyCode::Tab | KeyCode::Left => {
+                self.field_selected = self.field_selected.add(1).min(3);
+            }
+            KeyCode::Right => {
+                self.field_selected = self.field_selected.saturating_sub(1);
+            }
+            KeyCode::Up => {
+                self.field_selected = match self.field_selected {
+                    i @ (0 | 1) => i + 2,
+                    i => i,
+                };
+            }
+            KeyCode::Down => {
+                self.field_selected = match self.field_selected {
+                    i @ (2 | 3) => i + 0,
+                    i => i,
+                };
+            }
+            KeyCode::Home => {}
+            KeyCode::End => {}
+            KeyCode::PageUp => {}
+            KeyCode::PageDown => {}
+            KeyCode::BackTab => {}
+            KeyCode::Delete => {}
+            KeyCode::Insert => {}
+            KeyCode::F(_) => {}
+            KeyCode::Null => {}
+            KeyCode::Esc => {}
+        };
         Ok(())
     }
 
@@ -305,6 +448,36 @@ pub fn tui(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn input_handling_thread(_terminal: &Terminal<Backend>) -> Receiver<Event> {
+    let (tx, rx) = mpsc::channel();
+
+    let tick_rate = Duration::from_millis(1000 / 60);
+    thread::spawn(move || {
+        let mut last_tick = Instant::now();
+        loop {
+            // Poll for tick rate duration, if no events, sent tick event.
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0));
+
+            // Poll for events
+            if event::poll(timeout).unwrap() {
+                if let CEvent::Key(key) = event::read().unwrap() {
+                    tx.send(Event::Input(key)).unwrap();
+                }
+            }
+
+            // Send tick event regularly
+            if last_tick.elapsed() >= tick_rate {
+                tx.send(Event::Tick).unwrap();
+                last_tick = Instant::now();
+            }
+        }
+    });
+
+    rx
+}
+
+fn downloading_thread(_terminal: &Terminal<Backend>) -> Receiver<Event> {
     let (tx, rx) = mpsc::channel();
 
     let tick_rate = Duration::from_millis(1000 / 60);

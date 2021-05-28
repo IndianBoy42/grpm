@@ -1,4 +1,3 @@
-use futures::executor::block_on;
 use octocrab::{
     self,
     models::{
@@ -71,6 +70,34 @@ impl AssetFinder {
     }
 }
 
+pub async fn list_releases_page(
+    user: &str,
+    repo: &str,
+    page: u32,
+    per: u8,
+) -> Result<Vec<Release>, Error> {
+    let inst = octocrab::instance();
+    let repos = inst.repos(user, repo);
+    let rels = repos.releases();
+    Ok(rels
+        .list()
+        .per_page(per.min(100))
+        .page(page)
+        .send()
+        .await?
+        .take_items())
+}
+pub async fn list_releases(user: &str, repo: &str) -> Result<Vec<Release>, Error> {
+    let inst = octocrab::instance();
+    let repos = inst.repos(user, repo);
+    let rels = repos.releases();
+    let mut current_page = rels.list().per_page(100).page(0u32).send().await?;
+    let mut prs = current_page.take_items();
+    while let Ok(Some(mut new_page)) = inst.get_page(&current_page.next).await {
+        prs.extend(new_page.take_items());
+    }
+    Ok(prs)
+}
 pub async fn find_release(
     user: &str,
     repo: &str,
@@ -82,7 +109,6 @@ pub async fn find_release(
 
     find.find(rels).await
 }
-
 pub async fn find_asset(user: &str, repo: &str, find: AssetFinder) -> Result<Option<Asset>, Error> {
     let inst = octocrab::instance();
     let repos = inst.repos(user, repo);
