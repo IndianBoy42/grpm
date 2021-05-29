@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use octocrab::{
     self,
     models::{
@@ -42,6 +43,21 @@ impl ReleaseFinder {
             }
         }
     }
+    fn find_from(&self, rels: Vec<Release>) -> Vec<Release> {
+        match self {
+            ReleaseFinder::Latest => vec![rels[0].clone()],
+            ReleaseFinder::ByTag(tag) => rels
+                .iter()
+                .cloned()
+                .filter(|rel| &rel.tag_name == tag)
+                .collect_vec(),
+            ReleaseFinder::ByRegex(re) => rels
+                .iter()
+                .cloned()
+                .filter(|rel| re.is_match(&rel.tag_name))
+                .collect_vec(),
+        }
+    }
 }
 
 impl Default for ReleaseFinder {
@@ -68,6 +84,21 @@ impl AssetFinder {
             &AssetFinder::ById(id) => Some(rels.get_asset(id).await?),
         })
     }
+}
+
+pub fn find_release_from(re: &Regex, assets: &[Release]) -> Vec<Release> {
+    assets
+        .iter()
+        .filter(|rel| re.is_match(&rel.tag_name))
+        .cloned()
+        .collect_vec()
+}
+pub fn find_asset_from(re: &Regex, assets: &[Asset]) -> Vec<Asset> {
+    assets
+        .iter()
+        .filter(|ass| re.is_match(&ass.name))
+        .cloned()
+        .collect_vec()
 }
 
 pub async fn list_releases_page(

@@ -14,61 +14,79 @@ OPTIONS:
 COMMAND:
     tui               Open the TUI for interactively finding and installing
 cli -- If any arguments are not provided then the TUI opens
-    install [OWNER] [REPO] [VERSION] [FILE] Install from URL with 
-    search  [OWNER] [REPO] [VERSION] [FILE] Search releases from URL
+    install   [OWNER] [REPO] [RELEASE] [ASSET] Install from URL with 
+    releases  [OWNER] [REPO] [RELEASE]         Search releases from URL
+    assets    [OWNER] [REPO] [RELEASE] [ASSET] Search assets from URL
 
-    VERSION and FILE can be one of the following:
-    `[VERSION] [FILE]`     may be replaced by `[ASSETID]` for directly finding a certain asset
-    [VERSION] = latest,    get the latest download
-    [VERSION] = -t {TAG},  get a certain tag
-    [VERSION] = -r {TAG},  get first matching a certain regex
+    RELEASE and ASSET can be one of the following:
+    `[RELEASE] [ASSET]`     may be replaced by `[ASSETID]` for directly finding a certain asset
+    [RELEASE] = latest,    get the latest download
+    [RELEASE] = t:{TAG},  get a certain tag
+    [RELEASE] = r:{REGEX},  get first matching a certain regex
     URL is a string like 'user/repo'
 ";
 
 #[derive(Debug)]
 pub struct Args {
     command: String,
+    owner: Option<String>,
+    repo: Option<String>,
+    release: Option<String>,
+    asset: Option<String>,
 }
 impl Default for Args {
     fn default() -> Self {
         Args {
             command: "tui".to_string(),
+            owner: None,
+            repo: None,
+            release: None,
+            asset: None,
         }
-    }
-}
-impl Args {
-    fn parse_env() -> Args {
-        let mut pargs = pico_args::Arguments::from_env();
-        if pargs.contains(["-h", "--help"]) {
-            print!("{}", HELP);
-            std::process::exit(0);
-        }
-
-        let command: String = match pargs.free_from_str() {
-            Ok(e) => e,
-            Err(MissingArgument) => {
-                eprintln!("No command given");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                std::panic!("{}", e);
-            }
-        };
-
-        let dargs = Args::default();
-
-        Args { command }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
 
-    let args = Args::parse_env();
+    let mut pargs = pico_args::Arguments::from_env();
+    if pargs.contains(["-h", "--help"]) {
+        print!("{}", HELP);
+        std::process::exit(0);
+    }
 
+    let mut arg = || pargs.opt_free_from_str().unwrap();
+    let command = arg().expect("No command given");
+    let owner: Option<String> = arg();
+    let (owner, repo) = if let Some(owner) = owner {
+        if let Some((owner, repo)) = owner.split_once('/') {
+            (Some(owner.to_owned()), Some(repo.to_owned()))
+        } else {
+            (Some(owner), arg())
+        }
+    } else {
+        (None, None)
+    };
+    let release = arg();
+    let asset = arg();
 
-    match args.command.to_ascii_lowercase().as_str() {
-        "tui" => tuiapp::tui(args),
+    let dargs = Args::default();
+    let args = Args {
+        command,
+        owner,
+        repo,
+        release,
+        asset,
+    };
+
+    println!("{:?}", args);
+
+    if args.command.as_str() == "tui" {
+        return tuiapp::tui(args);
+    }
+    match args.command.as_str() {
+        "install" => todo!("CLI install"),
+        "search" => todo!("CLI search"),
         _ => panic!("Invalid Command"),
     }
 }

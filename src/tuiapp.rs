@@ -7,13 +7,19 @@ use futures::executor::block_on;
 use itertools::Itertools;
 use octocrab::models::repos::{Asset, Release};
 use regex::Regex;
-use std::io::stdout;
-use std::ops::Add;
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    io::stdout,
+    sync::mpsc::{Receiver, Sender},
+};
+use std::{ops::Add, sync::mpsc};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use std::{sync::Mutex, thread};
 use tui::widgets::Table;
 use tui::widgets::{Block, BorderType, Borders, Paragraph, Row, Wrap};
+use tui::Frame;
 use tui::{backend::CrosstermBackend, Terminal};
 use tui::{
     layout::Direction,
@@ -23,7 +29,6 @@ use tui::{
     layout::{Alignment, Constraint, Layout, Rect},
     text::Text,
 };
-use tui::Frame;
 
 use crate::{common, Args};
 
@@ -138,6 +143,15 @@ impl Areas {
 }
 
 impl TuiApp {
+    fn selected_field(&self) -> &str {
+        match self.field_selected {
+            0 => &self.owner,
+            1 => &self.repo,
+            2 => &self.search_rels,
+            3 => &self.search_assets,
+            _ => panic!("Invalid field"),
+        }
+    }
     fn selected_field_mut(&mut self) -> &mut String {
         match self.field_selected {
             0 => &mut self.owner,
@@ -149,11 +163,10 @@ impl TuiApp {
     }
     fn new(args: Args) -> Self {
         Self {
-            args,
-            owner: String::from("<search>"),
-            repo: String::from("<search>"),
-            search_rels: String::from("<search>"),
-            search_assets: String::from("<search>"),
+            owner: args.owner.clone().unwrap_or(String::from("<search>")),
+            repo: args.repo.clone().unwrap_or(String::from("<search>")),
+            search_rels: args.release.clone().unwrap_or(String::from("<search>")),
+            search_assets: args.asset.clone().unwrap_or(String::from("<search>")),
             desc_box_size: 10,
             field_selected: 0,
             found_releases: Vec::new(),
@@ -164,6 +177,7 @@ impl TuiApp {
             selected_asset: 0,
             release_re: None,
             asset_re: None,
+            args,
         }
     }
 
@@ -284,11 +298,7 @@ impl TuiApp {
             self.release_re = Some(Regex::new(&self.search_rels)?);
         }
         self.found_releases = if let Some(re) = &self.release_re {
-            self.all_releases
-                .iter()
-                .cloned()
-                .filter(|rel| re.is_match(&rel.tag_name))
-                .collect_vec()
+            common::find_release_from(&re, &self.all_releases)
         } else {
             self.all_releases.clone()
         };
@@ -302,12 +312,7 @@ impl TuiApp {
             self.asset_re = Some(Regex::new(&self.search_assets)?);
         }
         self.found_assets = if let Some(re) = &self.asset_re {
-            self.found_releases[self.selected_release]
-                .assets
-                .iter()
-                .cloned()
-                .filter(|ass| re.is_match(&ass.name))
-                .collect_vec()
+            common::find_asset_from(&re, &self.found_releases[self.selected_release].assets)
         } else {
             self.found_releases[self.selected_release].assets.clone()
         };
@@ -366,20 +371,20 @@ impl TuiApp {
                 };
             }
             KeyCode::Tab | KeyCode::Left => {
-                self.field_selected = self.field_selected.add(1).min(3);
+                self.field_selected = self.field_selected.saturating_sub(1);
             }
             KeyCode::Right => {
-                self.field_selected = self.field_selected.saturating_sub(1);
+                self.field_selected = self.field_selected.add(1).min(3);
             }
             KeyCode::Up => {
                 self.field_selected = match self.field_selected {
-                    i @ (0 | 1) => i + 2,
+                    i @ (2 | 3) => i - 2,
                     i => i,
                 };
             }
             KeyCode::Down => {
                 self.field_selected = match self.field_selected {
-                    i @ (2 | 3) => i + 0,
+                    i @ (0 | 1) => i + 2,
                     i => i,
                 };
             }
@@ -418,7 +423,7 @@ pub fn tui(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let rx = input_handling_thread(&terminal);
+    let (tx, rx) = input_handling_thread(&terminal);
     let mut app = TuiApp::new(args);
 
     terminal.clear()?;
@@ -447,62 +452,46 @@ pub fn tui(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn input_handling_thread(_terminal: &Terminal<Backend>) -> Receiver<Event> {
+fn input_handling_thread(
+    _terminal: &Terminal<Backend>,
+) -> (Arc<Mutex<Sender<Event>>>, Receiver<Event>) {
     let (tx, rx) = mpsc::channel();
+    let tx = Arc::new(Mutex::new(tx));
 
     let tick_rate = Duration::from_millis(1000 / 60);
-    thread::spawn(move || {
-        let mut last_tick = Instant::now();
-        loop {
-            // Poll for tick rate duration, if no events, sent tick event.
-            let timeout = tick_rate
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or_else(|| Duration::from_secs(0));
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut last_tick = Instant::now();
+            loop {
+                // Poll for tick rate duration, if no events, sent tick event.
+                let timeout = tick_rate
+                    .checked_sub(last_tick.elapsed())
+                    .unwrap_or_else(|| Duration::from_secs(0));
 
-            // Poll for events
-            if event::poll(timeout).unwrap() {
-                if let CEvent::Key(key) = event::read().unwrap() {
-                    tx.send(Event::Input(key)).unwrap();
+                // Poll for events
+                if event::poll(timeout).unwrap() {
+                    if let CEvent::Key(key) = event::read().unwrap() {
+                        tx.lock().unwrap().send(Event::Input(key)).unwrap();
+                    }
+                }
+
+                // Send tick event regularly
+                if last_tick.elapsed() >= tick_rate {
+                    tx.lock().unwrap().send(Event::Tick).unwrap();
+                    last_tick = Instant::now();
                 }
             }
+        });
+    }
 
-            // Send tick event regularly
-            if last_tick.elapsed() >= tick_rate {
-                tx.send(Event::Tick).unwrap();
-                last_tick = Instant::now();
-            }
-        }
-    });
-
-    rx
+    (tx, rx)
 }
 
-fn downloading_thread(_terminal: &Terminal<Backend>) -> Receiver<Event> {
-    let (tx, rx) = mpsc::channel();
-
-    let tick_rate = Duration::from_millis(1000 / 60);
-    thread::spawn(move || {
-        let mut last_tick = Instant::now();
-        loop {
-            // Poll for tick rate duration, if no events, sent tick event.
-            let timeout = tick_rate
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or_else(|| Duration::from_secs(0));
-
-            // Poll for events
-            if event::poll(timeout).unwrap() {
-                if let CEvent::Key(key) = event::read().unwrap() {
-                    tx.send(Event::Input(key)).unwrap();
-                }
-            }
-
-            // Send tick event regularly
-            if last_tick.elapsed() >= tick_rate {
-                tx.send(Event::Tick).unwrap();
-                last_tick = Instant::now();
-            }
-        }
-    });
-
-    rx
-}
+// fn downloading_thread(_terminal: &Terminal<Backend>, tx: Arc<Mutex<Sender<Event>>>, rx: Receiver<Download>) {
+//     let tick_rate = Duration::from_millis(1000 / 60);
+//     thread::spawn(move || {
+//         let mut last_tick = Instant::now();
+//         loop {}
+//     });
+// }
