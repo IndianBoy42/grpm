@@ -3,7 +3,6 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures::executor::block_on;
 use itertools::Itertools;
 use octocrab::models::repos::{Asset, Release};
 use regex::Regex;
@@ -17,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 use std::{sync::Mutex, thread};
+use tokio::runtime::Runtime;
 use tui::widgets::Table;
 use tui::widgets::{Block, BorderType, Borders, Paragraph, Row, Wrap};
 use tui::Frame;
@@ -30,19 +30,24 @@ use tui::{
     text::Text,
 };
 
-use crate::{common, Args};
+use crate::{common, ArgFlags, Args};
 
 type Backend = CrosstermBackend<std::io::Stdout>;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
     Tick,
     Input(KeyEvent),
 }
+#[derive(Debug, Clone, PartialEq)]
+enum DownloadPlease {
+    Releases(String, String),
+    Asset(Asset),
+}
 
 #[derive(Debug)]
 struct TuiApp {
-    args: Args,
+    args: ArgFlags,
 
     desc_box_size: u16,
 
@@ -61,6 +66,9 @@ struct TuiApp {
     all_releases: Vec<Release>,
     found_releases: Vec<Release>,
     found_assets: Vec<Asset>,
+
+    try_dl_repo: Sender<DownloadPlease>,
+    get_dl_repo: Receiver<Vec<Release>>,
 }
 
 struct Areas {
@@ -134,8 +142,8 @@ impl Areas {
             release_field: toprow[1][1],
             asset_key: toprow[1][2],
             asset_field: toprow[1][3],
-            found_assets: body[0],
-            found_releases: body[1],
+            found_releases: body[0],
+            found_assets: body[1],
             buttons,
             description: bottom,
         }
@@ -161,12 +169,16 @@ impl TuiApp {
             _ => panic!("Invalid field"),
         }
     }
-    fn new(args: Args) -> Self {
-        Self {
-            owner: args.owner.clone().unwrap_or(String::from("<search>")),
-            repo: args.repo.clone().unwrap_or(String::from("<search>")),
-            search_rels: args.release.clone().unwrap_or(String::from("<search>")),
-            search_assets: args.asset.clone().unwrap_or(String::from("<search>")),
+    fn new(
+        args: Args,
+        try_dl_repo: Sender<DownloadPlease>,
+        get_dl_repo: Receiver<Vec<Release>>,
+    ) -> Self {
+        let app = Self {
+            owner: args.owner.clone().unwrap_or(String::from(".*")),
+            repo: args.repo.clone().unwrap_or(String::from("*")),
+            search_rels: args.release.clone().unwrap_or(String::from("*")),
+            search_assets: args.asset.clone().unwrap_or(String::from("*")),
             desc_box_size: 10,
             field_selected: 0,
             found_releases: Vec::new(),
@@ -177,8 +189,20 @@ impl TuiApp {
             selected_asset: 0,
             release_re: None,
             asset_re: None,
-            args,
+            args: args.flags,
+            try_dl_repo,
+            get_dl_repo,
+        };
+        if let (Some(_), Some(_)) = (args.owner, args.repo) {
+            app.update_release_list().unwrap();
+            // if let Some(_) = args.release {
+            //     app.update_release_re(true).unwrap();
+            // }
+            // if let Some(_) = args.asset {
+            //     app.update_asset_re(true).unwrap();
+            // }
         }
+        app
     }
 
     fn draw(&self, f: &mut Frame<Backend>) {
@@ -186,9 +210,6 @@ impl TuiApp {
 
         let block = Self::block();
         f.render_widget(block.clone(), chunks.top_area);
-        f.render_widget(block.clone().title("Releases"), chunks.found_releases);
-        f.render_widget(block.clone().title("Assets"), chunks.found_assets);
-        f.render_widget(block.title("Description"), chunks.description);
 
         let text = |t, s| Paragraph::new(Text::styled(t, s));
 
@@ -236,37 +257,50 @@ impl TuiApp {
         let releases = Table::new(
             self.found_releases
                 .iter()
+                // .take(10)
                 .map(|rel| {
                     Row::new(vec![
-                        rel.name.clone().unwrap_or(String::new()),
                         rel.tag_name.clone(),
                         rel.published_at.to_string(),
+                        rel.name.clone().unwrap_or(String::from("N/A")),
                     ])
                 })
                 .collect_vec(),
         )
-        .header(Row::new(vec!["name", "tag_name", "published_at"]).bottom_margin(1));
-        f.render_widget(releases, chunks.found_releases);
+        .widths(&[
+            Constraint::Percentage(50), // TODO: How to chose the lengths? why Min(0) doesnt work...
+            Constraint::Length(10),
+            Constraint::Max(10),
+        ])
+        .header(Row::new(vec!["tag_name", "published_at", "name"]));
+        f.render_widget(
+            releases.block(block.clone().title("Releases")),
+            chunks.found_releases,
+        );
 
         let assets = Table::new(
-            self.found_releases
-                .get(self.selected_release)
-                .map(|x| {
-                    x.assets
-                        .iter()
-                        .map(|ass| {
-                            Row::new(vec![
-                                ass.label.clone().unwrap_or(String::new()),
-                                ass.name.clone(),
-                                ass.id.to_string(),
-                            ])
-                        })
-                        .collect_vec()
+            self.found_assets
+                .iter()
+                // .take(10)
+                .map(|ass| {
+                    Row::new(vec![
+                        ass.name.clone(),
+                        ass.label.clone().unwrap_or(String::from("N/A")),
+                        ass.id.to_string(),
+                    ])
                 })
-                .unwrap_or(vec![]),
+                .collect_vec(),
         )
-        .header(Row::new(vec!["label", "name", "id"]).bottom_margin(1));
-        f.render_widget(assets, chunks.found_assets);
+        .widths(&[
+            Constraint::Percentage(50), // TODO: How to chose the lengths? why Min(0) doesnt work...
+            Constraint::Length(10),
+            Constraint::Min(10),
+        ])
+        .header(Row::new(vec!["name", "label", "id"]));
+        f.render_widget(
+            assets.block(block.clone().title("Assets")),
+            chunks.found_assets,
+        );
 
         // TODO: format the whole description
         let desc = match self.selected_col {
@@ -290,13 +324,24 @@ impl TuiApp {
             _ => Text::raw(""),
         };
         let desc = Paragraph::new(desc).wrap(Wrap { trim: false });
-        f.render_widget(desc, chunks.description);
+        f.render_widget(desc.block(block.title("Description")), chunks.description);
     }
 
+    fn update_release_list(&self) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(self.try_dl_repo.send(DownloadPlease::Releases(
+            self.owner.clone(),
+            self.repo.clone(),
+        ))?)
+    }
     fn update_release_re(&mut self, recompile: bool) -> Result<(), Box<dyn std::error::Error>> {
         if recompile {
-            self.release_re = Some(Regex::new(&self.search_rels)?);
+            if self.search_rels == "" {
+                self.release_re = Some(Regex::new(".*")?);
+            } else {
+                self.release_re = Some(Regex::new(&self.search_rels)?);
+            }
         }
+        // eprintln!("{:?}", self.all_releases);
         self.found_releases = if let Some(re) = &self.release_re {
             common::find_release_from(&re, &self.all_releases)
         } else {
@@ -309,12 +354,24 @@ impl TuiApp {
     }
     fn update_asset_re(&mut self, recompile: bool) -> Result<(), Box<dyn std::error::Error>> {
         if recompile {
-            self.asset_re = Some(Regex::new(&self.search_assets)?);
+            if self.search_assets == "" {
+                self.asset_re = Some(Regex::new(".*")?);
+            } else {
+                self.asset_re = Some(Regex::new(&self.search_assets)?);
+            }
         }
         self.found_assets = if let Some(re) = &self.asset_re {
-            common::find_asset_from(&re, &self.found_releases[self.selected_release].assets)
+            if let Some(selected_release) = self.found_releases.get(self.selected_release) {
+                common::find_asset_from(&re, &selected_release.assets)
+            } else {
+                vec![]
+            }
         } else {
-            self.found_releases[self.selected_release].assets.clone()
+            if let Some(selected_release) = self.found_releases.get(self.selected_release) {
+                selected_release.assets.clone()
+            } else {
+                vec![]
+            }
         };
         Ok(())
     }
@@ -323,9 +380,6 @@ impl TuiApp {
         match key {
             KeyCode::Char(c) => {
                 let f = self.selected_field_mut();
-                if f == "<search>" {
-                    f.clear();
-                }
                 f.push(c);
 
                 match self.field_selected {
@@ -339,10 +393,14 @@ impl TuiApp {
             }
             KeyCode::Backspace => {
                 let f = self.selected_field_mut();
-                if f == "<search>" {
+                if f == ".*" {
                     f.clear();
+                } else {
+                    f.pop();
+                    if f == "" {
+                        *f = String::from(".*");
+                    }
                 }
-                f.pop();
 
                 match self.field_selected {
                     // Only Update the repo on Enter
@@ -356,24 +414,16 @@ impl TuiApp {
             KeyCode::Enter => {
                 match self.field_selected {
                     // Update the repo
-                    0 | 1 => {
-                        self.selected_col = 0;
-                        self.selected_asset = 0;
-                        self.selected_release = 0;
-                        self.all_releases =
-                            // TODO: move this to a different thread?
-                            block_on(common::list_releases(&self.owner, &self.repo))?;
-                        self.found_releases = self.all_releases.clone();
-                    }
+                    0 | 1 => self.update_release_list()?,
                     2 => self.update_release_re(true)?,
                     3 => self.update_asset_re(true)?,
                     _ => panic!("Invalid field"),
                 };
             }
-            KeyCode::Tab | KeyCode::Left => {
+            KeyCode::Left => {
                 self.field_selected = self.field_selected.saturating_sub(1);
             }
-            KeyCode::Right => {
+            KeyCode::Tab | KeyCode::Right => {
                 self.field_selected = self.field_selected.add(1).min(3);
             }
             KeyCode::Up => {
@@ -403,6 +453,16 @@ impl TuiApp {
     }
 
     fn on_tick(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let rels = self.get_dl_repo.try_iter().last();
+        if let Some(rels) = rels {
+            self.all_releases = rels;
+            self.found_releases = self.all_releases.clone();
+            self.selected_col = 0;
+            self.selected_asset = 0;
+            self.selected_release = 0;
+            self.update_release_re(true)?;
+            self.update_asset_re(true)?;
+        }
         Ok(())
     }
 
@@ -424,7 +484,8 @@ pub fn tui(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let (tx, rx) = input_handling_thread(&terminal);
-    let mut app = TuiApp::new(args);
+    let (send_repos, recv_rels) = downloading_thread(&terminal);
+    let mut app = TuiApp::new(args, send_repos, recv_rels);
 
     terminal.clear()?;
 
@@ -488,10 +549,27 @@ fn input_handling_thread(
     (tx, rx)
 }
 
-// fn downloading_thread(_terminal: &Terminal<Backend>, tx: Arc<Mutex<Sender<Event>>>, rx: Receiver<Download>) {
-//     let tick_rate = Duration::from_millis(1000 / 60);
-//     thread::spawn(move || {
-//         let mut last_tick = Instant::now();
-//         loop {}
-//     });
-// }
+fn downloading_thread(
+    _terminal: &Terminal<Backend>,
+) -> (Sender<DownloadPlease>, Receiver<Vec<Release>>) {
+    let (send_repos, recv_repos) = mpsc::channel();
+    let (send_rels, recv_rels) = mpsc::channel();
+
+    thread::spawn(move || {
+        let rt = Runtime::new().unwrap();
+        use DownloadPlease::*;
+        while let Ok(req) = recv_repos.recv() {
+            match req {
+                Releases(owner, repo) => {
+                    let rels = rt.block_on(common::list_releases(&owner, &repo)).unwrap();
+                    send_rels.send(rels).unwrap();
+                }
+                Asset(ass) => {
+                    // TODO: Download the asset
+                }
+            }
+        }
+    });
+
+    (send_repos, recv_rels)
+}

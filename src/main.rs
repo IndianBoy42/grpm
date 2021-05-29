@@ -1,5 +1,3 @@
-use pico_args::Error::MissingArgument;
-
 mod common;
 mod tuiapp;
 
@@ -26,6 +24,9 @@ cli -- If any arguments are not provided then the TUI opens
     URL is a string like 'user/repo'
 ";
 
+#[derive(Debug, Clone, Copy)]
+pub struct ArgFlags {}
+
 #[derive(Debug)]
 pub struct Args {
     command: String,
@@ -33,6 +34,7 @@ pub struct Args {
     repo: Option<String>,
     release: Option<String>,
     asset: Option<String>,
+    flags: ArgFlags,
 }
 impl Default for Args {
     fn default() -> Self {
@@ -42,6 +44,7 @@ impl Default for Args {
             repo: None,
             release: None,
             asset: None,
+            flags: ArgFlags {},
         }
     }
 }
@@ -77,9 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         repo,
         release,
         asset,
+        flags: ArgFlags {},
     };
-
-    println!("{:?}", args);
 
     if args.command.as_str() == "tui" {
         return tuiapp::tui(args);
