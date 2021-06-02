@@ -7,7 +7,9 @@ use itertools::Itertools;
 use octocrab::models::repos::{Asset, Release};
 use regex::Regex;
 use std::{
+    convert::TryInto,
     io::stdout,
+    mem::MaybeUninit,
     sync::mpsc::{Receiver, Sender},
 };
 use std::{ops::Add, sync::mpsc};
@@ -91,6 +93,14 @@ struct Areas {
     buttons: Vec<Rect>,
 }
 
+fn evensplit<const N: usize>() -> [Constraint; N] {
+    let mut arr = MaybeUninit::uninit_array();
+    for i in 0..N {
+        arr[i] = MaybeUninit::new(Constraint::Ratio(1, N.try_into().unwrap()));
+    }
+    unsafe { MaybeUninit::array_assume_init(arr) }
+}
+
 impl Areas {
     fn new(total: Rect, app: &TuiApp) -> Self {
         let block = TuiApp::block();
@@ -113,7 +123,7 @@ impl Areas {
 
         let buttons = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .constraints(evensplit::<4>())
             .split(buttons);
 
         let topbarsplit = Layout::default()
@@ -124,12 +134,7 @@ impl Areas {
 
         let split = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Ratio(1, 4),
-                Constraint::Ratio(1, 4),
-                Constraint::Ratio(1, 4),
-                Constraint::Ratio(1, 4),
-            ]);
+            .constraints(evensplit::<4>());
         let toprow = [split.split(toprow1), split.split(toprow2)];
 
         Self {
@@ -250,10 +255,19 @@ impl TuiApp {
             chunks.buttons[0],
         );
         f.render_widget(
-            text("Link", button_style).alignment(Alignment::Center),
+            text("Download", button_style).alignment(Alignment::Center),
             chunks.buttons[1],
         );
+        f.render_widget(
+            text("Save", button_style).alignment(Alignment::Center),
+            chunks.buttons[2],
+        );
+        f.render_widget(
+            text("Link", button_style).alignment(Alignment::Center),
+            chunks.buttons[3],
+        );
 
+        // TODO: do pagination (and integrate with the downloader to reduce the release fetch time)
         let releases = Table::new(
             self.found_releases
                 .iter()
@@ -549,6 +563,7 @@ fn input_handling_thread(
     (tx, rx)
 }
 
+// TODO: Cache the Release list in `~/.cache/grpm` and only download the new releases
 fn downloading_thread(
     _terminal: &Terminal<Backend>,
 ) -> (Sender<DownloadPlease>, Receiver<Vec<Release>>) {
